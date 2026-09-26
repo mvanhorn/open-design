@@ -10,7 +10,6 @@ import {
 import { Agent as HttpsAgent, request as createHttpsRequest } from "node:https";
 import { existsSync, readFileSync } from "node:fs";
 import { readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import {
   createConnection,
   createServer as createTcpServer,
@@ -21,8 +20,11 @@ import {
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { getSidecarStatus, type SidecarStamp } from "@open-design/sidecar";
 import {
+  APP_KEYS,
   SIDECAR_ENV,
+  type DaemonStatusSnapshot,
   type WebStatusSnapshot,
 } from "@open-design/sidecar-proto";
 
@@ -44,11 +46,15 @@ const STANDALONE_STARTUP_TIMEOUT_ENV = "OD_STANDALONE_STARTUP_TIMEOUT_MS";
 // isDaemonProxyConnectionFailure recognizes it as an outage.
 const DAEMON_PROXY_UNAVAILABLE_MESSAGE =
   `connect ECONNREFUSED (${DAEMON_PORT_ENV} is not set; the web runtime has no daemon origin)`;
+// One in-flight status read is enough. A finished lookup is not reused: the
+// daemon it described can exit and a replacement can bind that same port.
+const MANAGED_DAEMON_STATUS_TIMEOUT_MS = 1_000;
+const MANAGED_DAEMON_ORIGIN_UNAVAILABLE_MESSAGE =
+  "connect ECONNREFUSED (live daemon origin is unavailable)";
 const SHUTDOWN_TIMEOUT_MS = 3000;
 const WEB_HTTP_DRAIN_MS = 250;
 const STANDALONE_READINESS_POLL_MS = 150;
 const STANDALONE_TCP_READINESS_GRACE_MS = STANDALONE_READINESS_POLL_MS;
-const require = createRequire(import.meta.url);
 
 type NextApp = {
   close?: () => Promise<void>;
@@ -68,9 +74,26 @@ type StandaloneBackend = {
   stop(): Promise<void>;
 };
 
-function createNextApp(options: { dev: boolean; dir: string } & NextBundlerOptions): NextApp {
-  const createNextServer = require("next") as (nextOptions: { dev: boolean; dir: string } & NextBundlerOptions) => NextApp;
-  return createNextServer(options);
+async function createNextApp(options: { dev: boolean; dir: string } & NextBundlerOptions): Promise<NextApp> {
+  // Dynamic import keeps Next off the standalone path. The same specifier is
+  // what tests mock; Node's CJS interop exposes the constructor as `default`.
+  const nextModule: unknown = await import("next");
+  return resolveNextServerConstructor(nextModule)(options);
+}
+
+function resolveNextServerConstructor(
+  nextModule: unknown,
+): (nextOptions: { dev: boolean; dir: string } & NextBundlerOptions) => NextApp {
+  if (typeof nextModule === "function") {
+    return nextModule as (nextOptions: { dev: boolean; dir: string } & NextBundlerOptions) => NextApp;
+  }
+  if (typeof nextModule === "object" && nextModule != null && "default" in nextModule) {
+    const candidate = (nextModule as { default?: unknown }).default;
+    if (typeof candidate === "function") {
+      return candidate as (nextOptions: { dev: boolean; dir: string } & NextBundlerOptions) => NextApp;
+    }
+  }
+  throw new Error("failed to load Next.js server constructor");
 }
 
 export function resolveNextBundlerOptions(isDev: boolean): NextBundlerOptions {
@@ -212,7 +235,16 @@ export function resolveStandaloneServerEntry(
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
-export type WebRuntimeContext = { mode: string; [field: string]: unknown };
+export type WebRuntimeContext = {
+  mode: string;
+  // Authoritative five-field identity from the sidecar client. Managed
+  // production uses it to address the sibling daemon. Direct callers omit it
+  // and keep the explicit OD_PORT target.
+  stamp?: SidecarStamp;
+  [field: string]: unknown;
+};
+
+export type DaemonOriginResolver = () => Promise<string | null>;
 
 function shouldUseStandaloneOutput(runtime: WebRuntimeContext): boolean {
   return runtime.mode !== "dev" && process.env[WEB_OUTPUT_MODE_ENV] === "standalone";
@@ -227,6 +259,86 @@ function resolveDaemonOrigin(): string | null {
     return null;
   }
   return `http://${DAEMON_HOST}:${port}`;
+}
+
+function isWebSidecarStamp(value: unknown): value is SidecarStamp {
+  if (typeof value !== "object" || value == null) return false;
+  const stamp = value as Record<string, unknown>;
+  return (
+    typeof stamp.app === "string"
+    && typeof stamp.channel === "string"
+    && typeof stamp.mode === "string"
+    && typeof stamp.namespace === "string"
+    && typeof stamp.source === "string"
+  );
+}
+
+function resolveStartupDaemonOrigin(runtime: WebRuntimeContext): string | null | DaemonOriginResolver {
+  // Dev and direct unstamped callers keep the explicit environment port.
+  // Managed production follows the sibling daemon instead of that spawn-time value.
+  if (runtime.mode === "dev" || runtime.stamp == null) return resolveDaemonOrigin();
+  if (!isWebSidecarStamp(runtime.stamp)) {
+    throw new Error("web sidecar stamp must include channel, namespace, source, mode, and app");
+  }
+  return createManagedDaemonOriginResolver(runtime.stamp);
+}
+
+function siblingDaemonStamp(webStamp: SidecarStamp): SidecarStamp {
+  return {
+    app: APP_KEYS.DAEMON,
+    channel: webStamp.channel,
+    mode: webStamp.mode,
+    namespace: webStamp.namespace,
+    source: webStamp.source,
+  };
+}
+
+/**
+ * Resolve the sibling daemon before each proxied request. Simultaneous
+ * callers share the outstanding read; a rejection clears that shared promise
+ * so the next request can discover a replacement daemon. The original
+ * generation PID is intentionally not part of the query.
+ */
+export function createManagedDaemonOriginResolver(webStamp: SidecarStamp): DaemonOriginResolver {
+  const daemonStamp = siblingDaemonStamp(webStamp);
+  let inflight: Promise<string | null> | null = null;
+
+  return () => {
+    if (inflight != null) return inflight;
+    let lookup!: Promise<string | null>;
+    lookup = readManagedDaemonOrigin(daemonStamp).finally(() => {
+      if (inflight === lookup) inflight = null;
+    });
+    inflight = lookup;
+    return lookup;
+  };
+}
+
+async function readManagedDaemonOrigin(daemonStamp: SidecarStamp): Promise<string | null> {
+  const status = await getSidecarStatus<DaemonStatusSnapshot>(daemonStamp, {
+    timeoutMs: MANAGED_DAEMON_STATUS_TIMEOUT_MS,
+  });
+  return usableLoopbackHttpOrigin(status?.url);
+}
+
+function usableLoopbackHttpOrigin(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.trim() !== value) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:") return null;
+  if (parsed.username.length > 0 || parsed.password.length > 0) return null;
+  // WHATWG URL.hostname keeps the brackets on an IPv6 address, so loopback is "[::1]".
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "[::1]") return null;
+  if (parsed.port.length > 0) {
+    const port = Number(parsed.port);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  }
+  return parsed.origin;
 }
 
 function resolveRequestPathname(requestUrl: string | undefined): string | null {
@@ -1031,10 +1143,15 @@ async function createWebSidecarHandle(
 }
 
 export function createDaemonProxyHandler(
-  daemonOrigin: string | null,
+  daemonOrigin: string | null | DaemonOriginResolver,
   fallback: (request: IncomingMessage, response: ServerResponse) => Promise<void>,
 ): (request: IncomingMessage, response: ServerResponse) => void {
   return (request, response) => {
+    if (typeof daemonOrigin === "function") {
+      dispatchResolvedDaemonProxy(daemonOrigin, fallback, request, response);
+      return;
+    }
+
     const daemonProxyTarget = daemonOrigin == null ? null : resolveDaemonProxyTarget(daemonOrigin, request.url);
     if (daemonProxyTarget != null) {
       const localPort = request.socket.localPort;
@@ -1068,16 +1185,82 @@ export function createDaemonProxyHandler(
   };
 }
 
+function dispatchResolvedDaemonProxy(
+  resolveOrigin: DaemonOriginResolver,
+  fallback: (request: IncomingMessage, response: ServerResponse) => Promise<void>,
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  // Decide routing before IPC so ordinary pages do not wait on daemon discovery.
+  // The request body stays unread until an origin is known.
+  const pathname = resolveRequestPathname(request.url);
+  if (pathname == null || !isDaemonProxyPathname(pathname)) {
+    void fallback(request, response).catch((error: unknown) => {
+      if (response.writableEnded || response.destroyed) return;
+      response.statusCode = 500;
+      response.end(error instanceof Error ? error.message : String(error));
+    });
+    return;
+  }
+
+  void proxyResolvedDaemonOrigin(resolveOrigin, request, response).catch((error: unknown) => {
+    if (isProxyClientClosed(request, response)) return;
+    respondPlainText(response, 502, error instanceof Error ? error.message : String(error));
+  });
+}
+
+async function proxyResolvedDaemonOrigin(
+  resolveOrigin: DaemonOriginResolver,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  let daemonOrigin: string | null = null;
+  try {
+    daemonOrigin = await resolveOrigin();
+  } catch {
+    daemonOrigin = null;
+  }
+  if (isProxyClientClosed(request, response)) return;
+
+  const target = daemonOrigin == null ? null : resolveDaemonProxyTarget(daemonOrigin, request.url);
+  if (target == null) {
+    respondPlainText(response, 502, MANAGED_DAEMON_ORIGIN_UNAVAILABLE_MESSAGE);
+    return;
+  }
+
+  const localPort = request.socket?.localPort;
+  await proxyHttpRequest(target, request, response, {
+    daemonWebPort: typeof localPort === "number" ? localPort : 0,
+  });
+}
+
+function isProxyClientClosed(request: IncomingMessage, response: ServerResponse): boolean {
+  return request.destroyed || response.destroyed || response.writableEnded || request.socket?.destroyed === true;
+}
+
+function respondPlainText(response: ServerResponse, statusCode: number, body: string): void {
+  if (response.writableEnded || response.destroyed) return;
+  try {
+    response.statusCode = statusCode;
+    if (!response.headersSent) {
+      response.setHeader("content-type", "text/plain; charset=utf-8");
+    }
+    response.end(body);
+  } catch {
+    // The client disconnected while discovery was still in flight.
+  }
+}
+
 async function startRegularNextSidecar(
   runtime: WebRuntimeContext,
   webRoot: string,
   port: number,
 ): Promise<WebSidecarHandle> {
   const dev = process.env.OD_WEB_PROD !== "1" && runtime.mode === "dev";
-  const app = createNextApp({ dev, dir: webRoot, ...resolveNextBundlerOptions(dev) });
+  const app = await createNextApp({ dev, dir: webRoot, ...resolveNextBundlerOptions(dev) });
   await prepareNextApp(app, webRoot);
 
-  const daemonOrigin = resolveDaemonOrigin();
+  const daemonOrigin = resolveStartupDaemonOrigin(runtime);
   const handleRequest = app.getRequestHandler();
   const httpServer = createHttpServer(createDaemonProxyHandler(daemonOrigin, handleRequest));
 
@@ -1091,7 +1274,7 @@ async function startStandaloneNextSidecar(
   webRoot: string | null,
   port: number,
 ): Promise<WebSidecarHandle> {
-  const daemonOrigin = resolveDaemonOrigin();
+  const daemonOrigin = resolveStartupDaemonOrigin(runtime);
   const backend = await startStandaloneBackend(webRoot);
   const httpServer = createHttpServer(createDaemonProxyHandler(daemonOrigin, async (request, response) => {
     if (!backend.isRunning()) {

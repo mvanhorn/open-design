@@ -1,8 +1,11 @@
+import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { getSidecarStatus, type SidecarStamp } from '@open-design/sidecar';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   createStandaloneBackendEnv,
@@ -15,6 +18,25 @@ import {
   resolveStandaloneServerEntry,
   startWebSidecar,
 } from '../sidecar/server';
+
+vi.mock('@open-design/sidecar', () => ({
+  getSidecarStatus: vi.fn(),
+}));
+
+vi.mock('next', () => ({
+  default: () => ({
+    prepare: async () => {},
+    getRequestHandler: () => async (
+      _request: unknown,
+      response: { statusCode: number; setHeader: (name: string, value: string) => void; end: (body: string) => void },
+    ) => {
+      response.statusCode = 200;
+      response.setHeader('content-type', 'text/html; charset=utf-8');
+      response.end('<!DOCTYPE html><html><body>app shell</body></html>');
+    },
+    close: async () => {},
+  }),
+}));
 
 describe('resolveDaemonProxyTarget', () => {
   it('proxies allowlisted relative paths to the daemon origin', () => {
@@ -292,6 +314,249 @@ describe('resolveNextBundlerOptions', () => {
 
   it('does not force a bundler for production mode', () => {
     expect(resolveNextBundlerOptions(false)).toEqual({});
+  });
+});
+
+const DAEMON_STATUS_TIMEOUT_MS = 1000;
+const STARTUP_ENV_KEYS = [
+  'OD_PORT',
+  'OD_WEB_OUTPUT_MODE',
+  'OD_WEB_STANDALONE_ROOT',
+  'OD_STANDALONE_STARTUP_TIMEOUT_MS',
+] as const;
+
+function snapshotStartupEnv(): Record<(typeof STARTUP_ENV_KEYS)[number], string | undefined> {
+  return {
+    OD_PORT: process.env.OD_PORT,
+    OD_WEB_OUTPUT_MODE: process.env.OD_WEB_OUTPUT_MODE,
+    OD_WEB_STANDALONE_ROOT: process.env.OD_WEB_STANDALONE_ROOT,
+    OD_STANDALONE_STARTUP_TIMEOUT_MS: process.env.OD_STANDALONE_STARTUP_TIMEOUT_MS,
+  };
+}
+
+function restoreStartupEnv(previous: Record<(typeof STARTUP_ENV_KEYS)[number], string | undefined>): void {
+  for (const key of STARTUP_ENV_KEYS) {
+    const value = previous[key];
+    if (value == null) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+async function startMarkedDaemon(marker: string): Promise<{
+  origin: string;
+  port: number;
+  requests: string[];
+  close: () => Promise<void>;
+}> {
+  const requests: string[] = [];
+  const server: HttpServer = createHttpServer((request, response) => {
+    requests.push(`${request.method ?? 'GET'} ${request.url ?? ''}`);
+    response.statusCode = 200;
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ marker }));
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const port = (server.address() as AddressInfo).port;
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    port,
+    requests,
+    close: async () => {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error == null ? resolve() : reject(error)));
+      });
+      server.closeAllConnections();
+    },
+  };
+}
+
+function installSiblingStatus(stamp: SidecarStamp, origin: string, decoyOrigin: string): void {
+  vi.mocked(getSidecarStatus).mockImplementation(async (candidate) => {
+    const identity = candidate as SidecarStamp;
+    const url = identity.app === 'daemon'
+      && identity.namespace === stamp.namespace
+      && identity.channel === stamp.channel
+      && identity.source === stamp.source
+      && identity.mode === stamp.mode
+      ? origin
+      : decoyOrigin;
+    return { desktopAuthGateActive: false, state: 'running', url };
+  });
+}
+
+describe('daemon origin startup wiring', () => {
+  it('follows live sidecar status for regular production and leaves pages on Next', async () => {
+    const previous = snapshotStartupEnv();
+    const stale = await startMarkedDaemon('stale');
+    const live = await startMarkedDaemon('live');
+    const decoy = await startMarkedDaemon('decoy');
+    const stamp: SidecarStamp = {
+      app: 'web',
+      channel: 'stable',
+      mode: 'runtime',
+      namespace: 'prod-regular',
+      source: 'packaged',
+    };
+    delete process.env.OD_WEB_OUTPUT_MODE;
+    delete process.env.OD_WEB_STANDALONE_ROOT;
+    process.env.OD_PORT = String(stale.port);
+    installSiblingStatus(stamp, live.origin, decoy.origin);
+    const handle = await startWebSidecar({ mode: 'runtime', stamp });
+
+    try {
+      const web = await handle.status();
+      const page = await fetch(new URL('/settings', web.url ?? ''));
+      expect(page.status).toBe(200);
+      expect(await page.text()).toContain('app shell');
+      expect(getSidecarStatus).not.toHaveBeenCalled();
+
+      const api = await fetch(new URL('/api/projects?limit=3', web.url ?? ''));
+      expect(api.status).toBe(200);
+      expect(await api.json()).toEqual({ marker: 'live' });
+      expect(live.requests).toEqual(['GET /api/projects?limit=3']);
+      expect(stale.requests).toEqual([]);
+      expect(decoy.requests).toEqual([]);
+      expect(vi.mocked(getSidecarStatus).mock.calls).toEqual([
+        [{ ...stamp, app: 'daemon' }, { timeoutMs: DAEMON_STATUS_TIMEOUT_MS }],
+      ]);
+    } finally {
+      await handle.stop();
+      await stale.close();
+      await live.close();
+      await decoy.close();
+      restoreStartupEnv(previous);
+      vi.mocked(getSidecarStatus).mockReset();
+    }
+  });
+
+  it('follows live sidecar status for standalone production', async () => {
+    const previous = snapshotStartupEnv();
+    const standaloneRoot = await mkdtemp(join(tmpdir(), 'open-design-web-live-origin-'));
+    const stale = await startMarkedDaemon('stale');
+    const live = await startMarkedDaemon('live');
+    const decoy = await startMarkedDaemon('decoy');
+    const stamp: SidecarStamp = {
+      app: 'web',
+      channel: 'stable',
+      mode: 'runtime',
+      namespace: 'prod-standalone',
+      source: 'packaged',
+    };
+    let handle: Awaited<ReturnType<typeof startWebSidecar>> | undefined;
+
+    try {
+      const fakeWebRoot = join(standaloneRoot, 'apps', 'web');
+      await mkdir(fakeWebRoot, { recursive: true });
+      await writeFile(
+        join(fakeWebRoot, 'server.js'),
+        `
+import { createServer } from 'node:http';
+
+const server = createServer((_request, response) => {
+  response.statusCode = 200;
+  response.setHeader('content-type', 'text/html; charset=utf-8');
+  response.end('<!DOCTYPE html><html><body>standalone shell</body></html>');
+});
+server.listen(Number(process.env.PORT), process.env.HOSTNAME || '127.0.0.1');
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`,
+        'utf8',
+      );
+      process.env.OD_WEB_OUTPUT_MODE = 'standalone';
+      process.env.OD_WEB_STANDALONE_ROOT = standaloneRoot;
+      process.env.OD_STANDALONE_STARTUP_TIMEOUT_MS = '3000';
+      process.env.OD_PORT = String(stale.port);
+      installSiblingStatus(stamp, live.origin, decoy.origin);
+
+      handle = await startWebSidecar({ mode: 'runtime', stamp });
+      const web = await handle.status();
+      const page = await fetch(new URL('/settings', web.url ?? ''));
+      expect(page.status).toBe(200);
+      expect(await page.text()).toContain('standalone shell');
+      expect(getSidecarStatus).not.toHaveBeenCalled();
+
+      const api = await fetch(new URL('/artifacts/board?download=1', web.url ?? ''));
+      expect(api.status).toBe(200);
+      expect(await api.json()).toEqual({ marker: 'live' });
+      expect(live.requests).toEqual(['GET /artifacts/board?download=1']);
+      expect(stale.requests).toEqual([]);
+      expect(decoy.requests).toEqual([]);
+      expect(vi.mocked(getSidecarStatus).mock.calls).toEqual([
+        [{ ...stamp, app: 'daemon' }, { timeoutMs: DAEMON_STATUS_TIMEOUT_MS }],
+      ]);
+    } finally {
+      await handle?.stop();
+      await stale.close();
+      await live.close();
+      await decoy.close();
+      restoreStartupEnv(previous);
+      vi.mocked(getSidecarStatus).mockReset();
+      await rm(standaloneRoot, { force: true, recursive: true });
+    }
+  });
+
+  it('keeps the explicit dev port when a stamp is present', async () => {
+    const previous = snapshotStartupEnv();
+    const explicit = await startMarkedDaemon('explicit');
+    const reported = await startMarkedDaemon('reported');
+    const stamp: SidecarStamp = {
+      app: 'web',
+      channel: 'local',
+      mode: 'dev',
+      namespace: 'dev-explicit',
+      source: 'tools-dev',
+    };
+    delete process.env.OD_WEB_OUTPUT_MODE;
+    delete process.env.OD_WEB_STANDALONE_ROOT;
+    process.env.OD_PORT = String(explicit.port);
+    installSiblingStatus(stamp, reported.origin, reported.origin);
+    const handle = await startWebSidecar({ mode: 'dev', stamp });
+
+    try {
+      const web = await handle.status();
+      const api = await fetch(new URL('/api/projects', web.url ?? ''));
+      expect(api.status).toBe(200);
+      expect(await api.json()).toEqual({ marker: 'explicit' });
+      expect(explicit.requests).toEqual(['GET /api/projects']);
+      expect(reported.requests).toEqual([]);
+      expect(getSidecarStatus).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop();
+      await explicit.close();
+      await reported.close();
+      restoreStartupEnv(previous);
+      vi.mocked(getSidecarStatus).mockReset();
+    }
+  });
+
+  it('keeps the explicit environment port for an unstamped runtime', async () => {
+    const previous = snapshotStartupEnv();
+    const explicit = await startMarkedDaemon('explicit');
+    delete process.env.OD_WEB_OUTPUT_MODE;
+    delete process.env.OD_WEB_STANDALONE_ROOT;
+    process.env.OD_PORT = String(explicit.port);
+    vi.mocked(getSidecarStatus).mockResolvedValue({
+      desktopAuthGateActive: false,
+      state: 'running',
+      url: 'http://127.0.0.1:9',
+    });
+    const handle = await startWebSidecar({ mode: 'runtime' });
+
+    try {
+      const web = await handle.status();
+      const api = await fetch(new URL('/frames/preview?t=1', web.url ?? ''));
+      expect(api.status).toBe(200);
+      expect(await api.json()).toEqual({ marker: 'explicit' });
+      expect(explicit.requests).toEqual(['GET /frames/preview?t=1']);
+      expect(getSidecarStatus).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop();
+      await explicit.close();
+      restoreStartupEnv(previous);
+      vi.mocked(getSidecarStatus).mockReset();
+    }
   });
 });
 
